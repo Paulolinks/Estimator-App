@@ -18,8 +18,8 @@ Crie o arquivo `.env.local` na raiz do projeto com:
 DATABASE_URL="postgresql://username:password@localhost:5432/estimator_app"
 
 # Stripe - Use suas chaves reais do Stripe Dashboard
-STRIPE_SECRET_KEY=sk_test_51QT9KeDtKhz2QbvYJHn...9g2FaVt75e00uZCmj7qS
-STRIPE_WEBHOOK_SECRET=whsec_6711338130fe6b27922c037f5c9b3e488083676827d9c0bee02a63ab6a9d26ee
+STRIPE_SECRET_KEY=sk_test_51QTfgh6hfr56h fake
+STRIPE_WEBHOOK_SECRET=whsec_456453 fake
 
 # NextAuth
 NEXTAUTH_URL=http://localhost:3000
