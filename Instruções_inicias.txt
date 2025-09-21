@@ -1,0 +1,492 @@
+
+
+# Decisão de stack (simples e escalável)
+
+* **Next.js 15 (App Router) + TypeScript**
+* **Postgres** (Supabase/Neon) + **Prisma**
+* **Stripe Connect (Express/Standard)** com **direct charges** + `application_fee_amount = 6%` (calculado por você)
+* **Auth**: NextAuth (ou Clerk) — qualquer um serve; use o que já domina
+
+> Com Connect (direct charges) você cria a cobrança **no Stripe do prestador** e coleta sua **application fee** (sua taxa) na mesma transação. Use o header `Stripe-Account: acct_...` ao agir “em nome” do conectado, e passe `application_fee_amount` (em cents). ([Stripe Docs][1])
+
+---
+Faça UI responsiva para todos.
+
+# Fluxo Stripe Connect (resumão)
+
+1. **Onboarding** do prestador
+
+   * Crie um **connected account** (Express/Standard).
+   * Gere um **Account Link** e redirecione para o onboarding hospedado pela Stripe. Ao concluir, você armazena `acct_...`. ([Stripe Docs][2])
+
+2. **Estimate → Invoice**
+
+   * Seu app cria **Customer** (opcional) e **Invoice** com **Invoice Items**, **finaliza** a fatura e pega a **Hosted Invoice Page** (**`hosted_invoice_url`**) — seu botão “Pagar” só redireciona. **Faça isso no connected account** usando `Stripe-Account`. ([Stripe Docs][3])
+
+3. **Fee de 6%**
+
+   * Ao cobrar (via Invoice/PaymentIntent no conectado), **passe `application_fee_amount`** = `Math.round(total_em_cents * 0.06)`. **Não há taxa extra da Stripe sobre a sua application fee** (ela já cobrou o processamento normal do vendedor). ([Stripe Docs][4])
+
+4. **Webhooks**
+
+   * Escute `invoice.paid`, `payment_intent.succeeded`, `payment_intent.payment_failed` para atualizar status (ex.: “Sinal pago”, “Saldo pago”, etc.). ([Stripe Docs][5])
+
+5. **Taxas/Impostos**
+
+   * Se quiser cálculo automático linha a linha, habilite **Stripe Tax** na Invoice. ([Stripe Docs][6])
+
+---
+
+# Estrutura de pastas
+
+```
+apps/estimator/
+  app/
+    (dashboard)/
+    api/
+      connect/
+        create-account/route.ts
+        account-link/route.ts
+        login-link/route.ts
+      estimates/
+        route.ts
+        [estimateId]/route.ts
+      invoices/
+        deposit/route.ts
+        balance/route.ts
+      stripe/
+        webhook/route.ts           // raw body
+    layout.tsx
+    page.tsx
+  components/
+    forms/
+    estimate/
+    payments/
+  lib/
+    stripe.ts
+    prisma.ts
+    auth.ts
+    money.ts
+  prisma/
+    schema.prisma
+  env.d.ts
+  package.json
+  .env.local (exemplo abaixo)
+```
+
+**.env.local (exemplo)**
+
+```
+DATABASE_URL=postgres://...
+STRIPE_SECRET_KEY=sk_live_xxx (ou sk_test_xxx)
+STRIPE_WEBHOOK_SECRET=whsec_xxx
+NEXT_PUBLIC_APP_URL=https://seu-dominio.com
+```
+
+---
+
+# Modelo de dados (Prisma – essencial)
+
+```prisma
+model Organization {
+  id                 String  @id @default(cuid())
+  name               String
+  billingMode        String  @default("connect") // 'single' | 'connect'
+  stripeAccountId    String? // acct_...
+  contractTemplateId String? // default contract
+  users              Membership[]
+  customers          Customer[]
+  estimates          Estimate[]
+  createdAt          DateTime @default(now())
+}
+
+model Membership {
+  id             String @id @default(cuid())
+  orgId          String
+  userId         String
+  role           String  // OWNER | ADMIN | SALES
+  organization   Organization @relation(fields: [orgId], references: [id])
+  // user -> tabela do seu auth
+}
+
+model Customer {
+  id              String @id @default(cuid())
+  orgId           String
+  name            String
+  email           String?
+  phone           String?
+  stripeCustomerId String?
+  organization    Organization @relation(fields: [orgId], references: [id])
+  estimates       Estimate[]
+}
+
+model Estimate {
+  id            String   @id @default(cuid())
+  orgId         String
+  customerId    String
+  status        String   @default("draft") // draft | sent | accepted | expired
+  expiresAt     DateTime?
+  subtotalCents Int
+  taxCents      Int       @default(0)
+  discountCents Int       @default(0)
+  totalCents    Int
+  notes         String?
+  contractId    String?   // snapshot
+  signatureId   String?
+  lineItems     LineItem[]
+  paymentPlan   PaymentSchedule?
+  organization  Organization @relation(fields: [orgId], references: [id])
+  customer      Customer @relation(fields: [customerId], references: [id])
+  createdAt     DateTime @default(now())
+}
+
+model LineItem {
+  id           String  @id @default(cuid())
+  estimateId   String
+  description  String
+  quantity     Int
+  unitCents    Int
+  taxCode      String?
+  estimate     Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model PaymentSchedule {
+  id             String @id @default(cuid())
+  estimateId     String @unique
+  // Ex.: milestones: [{"name":"Sinal","percent":50},{"name":"Saldo","percent":50}]
+  milestonesJson String
+  estimate       Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model InvoiceRecord {
+  id               String   @id @default(cuid())
+  estimateId       String
+  type             String   // deposit | balance | milestone
+  stripeInvoiceId  String
+  hostedUrl        String
+  amountCents      Int
+  status           String   // open | paid | void
+  createdAt        DateTime @default(now())
+}
+
+model ContractTemplate {
+  id        String  @id @default(cuid())
+  orgId     String
+  name      String
+  content   String  // markdown / html com {{placeholders}}
+  active    Boolean @default(true)
+}
+
+model ContractSnapshot {
+  id        String  @id @default(cuid())
+  estimateId String @unique
+  content   String
+  createdAt DateTime @default(now())
+}
+
+model Signature {
+  id          String  @id @default(cuid())
+  estimateId  String  @unique
+  signerName  String
+  ipAddress   String
+  signedAt    DateTime @default(now())
+}
+
+model WebhookEvent {
+  id          String  @id @default(cuid())
+  stripeEvent String  @unique
+  type        String
+  payload     Json
+  processedAt DateTime?
+}
+```
+
+---
+
+# Rotas (API) essenciais
+
+## Connect (onboarding)
+
+* `POST /api/connect/create-account`
+  Cria **connected account** (Express/Standard). Retorna `acct_...`. ([Stripe Docs][7])
+* `POST /api/connect/account-link`
+  Recebe `acct_...` e responde com `url` do **Account Link** (`type=account_onboarding`, `refresh_url`, `return_url`). Redireciona o usuário para completar onboarding. ([Stripe Docs][8])
+* `POST /api/connect/login-link`
+  Cria link de **login** no **Express Dashboard** para o conectado (suporte/admin). ([Stripe Docs][9])
+
+> Dica: considere **Express** (painel simplificado para o prestador) ou **Standard** (prestador usa o dashboard completo). ([Stripe Docs][10])
+
+## Estimates
+
+* `POST /api/estimates` — cria/edita estimate (line items, totais, contrato ligado)
+* `POST /api/estimates/:id/send` — envia por e-mail/SMS link público
+* `POST /api/estimates/:id/accept` — registra **assinatura simples** (nome + IP + timestamp) + snapshot do contrato
+* `GET /api/estimates/:id/pdf` — gera PDF
+
+## Invoices (milestones 50/50 — exemplo)
+
+* `POST /api/invoices/deposit`
+  **Entrada:** `estimateId`
+  **Ação:** cria **Invoice Items** no **connected account** (com `Stripe-Account`), **finaliza** a Invoice e retorna **`hosted_invoice_url`**. ([Stripe Docs][11])
+* `POST /api/invoices/balance`
+  Igual acima, para o saldo (ou para qualquer milestone do `PaymentSchedule`).
+
+> **Fee de 6%:** ao criar/confirmar o pagamento (Invoice/PaymentIntent) no **connected account**, envie **`application_fee_amount`** em **cents** no **direct charge**. (Sua plataforma recebe essa taxa; Stripe não soma taxa em cima da sua fee). ([Stripe Docs][1])
+
+## Webhook
+
+* `POST /api/stripe/webhook` (route handler **com raw body**)
+  Trata:
+
+  * `invoice.finalized` → salva `hosted_invoice_url`
+  * `invoice.paid` → marca milestone como pago, notifica cliente
+  * `payment_intent.succeeded` / `payment_intent.payment_failed` → atualiza status e loga atividade ([Stripe Docs][5])
+
+---
+
+# Implementação do pagamento (ponto crítico)
+
+**Direct charge + fee (6%) no conectado:**
+
+* Faça chamadas usando **sua** secret key, porém com **header** `Stripe-Account: acct_...`. ([Stripe Docs][11])
+* Ao criar o pagamento de Invoice (ou PaymentIntent), **passe `application_fee_amount`** igual a **6% do total** (cents). ([Stripe Docs][1])
+* A página de pagamento é a **Hosted Invoice Page** (`hosted_invoice_url`), sem precisar construir checkout. ([Stripe Docs][12])
+
+**Observações úteis**
+
+* `application_fee_amount` deve ser **> 0** e **< total**. Não há taxa Stripe sobre a **sua** fee (além da taxa normal do processamento que o vendedor paga). ([Stripe Docs][4])
+* Se usar **Payment Links/Pricing Table** em casos simples, dá para operar também por Connect (mas aqui focaremos em **Invoices**). ([Stripe Docs][13])
+
+---
+
+# Funcionalidades do MVP (P0)
+
+* **Org + membros + papéis**
+* **Clientes (CRM leve)** com `stripe_customer_id`
+* **Estimates** com:
+
+  * Itens (qty, unit, descrição)
+  * **Contrato padrão** (config da org) + **placeholders** (ex.: `{{customer_name}}`, `{{job_address}}`)
+  * **Assinatura simples** (nome + IP + timestamp) + **snapshot** do contrato
+  * PDF/Share link
+* **Pagamentos por marcos (50/50)**:
+
+  * Botão **Gerar Sinal** → cria Invoice (no conectado) → retorna `hosted_invoice_url`
+  * Webhook `invoice.paid` → libera **Gerar Saldo**
+  * Botão **Gerar Saldo** → repete fluxo
+  * **Fee de 6%** via `application_fee_amount`
+* **Notificações**: e-mail/SMS de envio de estimate e confirmação de pagamento
+* **Logs/Auditoria** + tela de status
+
+**P1 (rápidos para depois)**
+
+* **Stripe Tax** toggle por organização (cálculo automático) ([Stripe Docs][6])
+* **Catálogo de itens/kits** (ex.: “Mini-split 12k + instalação”) ([Stripe Docs][14])
+* **Payment Links** para serviços simples/pacotes fixos ([Stripe Docs][13])
+* **Customer Portal** (histórico de faturas, atualização de cartão) ([Stripe Docs][15])
+* **Relatórios** (por período/serviço/técnico), export CSV
+
+---
+
+# Instruções de desenvolvimento (para salvar em `docs/DEV_GUIDE.md`)
+
+1. **Padrões**
+
+   * Tipos e dinheiro: manipule **sempre em cents** (`number` inteiro).
+   * **Idempotência**: nas operações Stripe sensíveis (criação de invoice/payment), use Idempotency-Key.
+   * **Webhooks**: trate **sempre** com **raw body** e verificação de assinatura.
+   * **Feature flags por organização**: `billingMode`, `stripeAccountId`, `useStripeTax`, `defaultContractTemplateId`.
+
+2. **Erros & Reprocessamento**
+
+   * Webhook: registre **tudo** em `WebhookEvent`, marque `processedAt` ao concluir.
+   * Se falhar, reprocessa por job (cron/queue) buscando eventos sem `processedAt`.
+
+3. **Segurança**
+
+   * Nunca exponha `sk_*` no cliente.
+   * Rotas que “agem em nome” do conectado validam se o **usuário atual** pertence à **Organization** dona do `acct_...`.
+
+4. **Contrato**
+
+   * `ContractTemplate.content` aceita **Markdown/HTML** com placeholders.
+   * Ao enviar estimate (ou no “Accept”), **gere `ContractSnapshot`** e **nunca** altere retroativamente.
+
+5. **UI/UX**
+
+   * Link público do estimate com CTA “Aceitar e pagar sinal”.
+   * Estado do botão muda conforme webhooks: “Pagar Sinal” → “Sinal Pago” → “Pagar Saldo” → “Quitado”.
+
+---
+
+# Template de PIP (para `docs/PIPs/PIP-000-template.md`)
+
+```
+# PIP-XYZ | Título
+## Contexto
+## Escopo
+## Não-escopo
+## Fluxo do usuário
+## API/DB
+## Stripe (objetos/eventos)
+## Critérios de aceite
+1) Dado ... Quando ... Então ...
+2) ...
+## Métricas de sucesso
+## Riscos/Legais
+## QA checklist
+```
+
+---
+
+# PIPs iniciais (com aceite enxuto)
+
+**PIP-001 | Onboarding Connect (Express/Standard)**
+
+* **Fluxo:** criar account → gerar account\_link → redirecionar → salvar `acct_...`
+* **Aceite:** consigo criar conta conectada em modo teste e ver `acct_...` salvo. ([Stripe Docs][2])
+
+**PIP-002 | Estimate + Contrato + Assinatura**
+
+* **Aceite:** estimate com itens → preview → “Incluir contrato padrão” → aceitar → cria `Signature` + `ContractSnapshot`.
+
+**PIP-003 | Invoice (Sinal) no conectado + Hosted Page**
+
+* **Aceite:** botão “Gerar Sinal” → cria invoice (connected) → finaliza → exibe `hosted_invoice_url`. ([Stripe Docs][11])
+
+**PIP-004 | Fee 6% (application\_fee\_amount)**
+
+* **Aceite:** em modo teste, fee da plataforma aparece no saldo da **plataforma** após pagamento. ([Stripe Docs][1])
+
+**PIP-005 | Webhooks**
+
+* **Aceite:** `invoice.paid` atualiza status do milestone e UI; `payment_intent.payment_failed` cria alerta. ([Stripe Docs][5])
+
+**PIP-006 | Invoice (Saldo)**
+
+* **Aceite:** somente após `invoice.paid` do sinal; fluxo idêntico ao anterior.
+
+---
+
+# Prompts prontos para o Cursor (um único chat)
+
+Cole cada um conforme for avançando:
+
+### 1) Setup e boilerplate
+
+> **PROMPT:**
+> Prepare um projeto Next.js 15 (App Router) em TypeScript com Prisma (Postgres) e Stripe. Crie as pastas e arquivos conforme esta árvore: \[cole a estrutura de pastas acima]. Configure `lib/stripe.ts` com o SDK oficial, `lib/prisma.ts`, e rotas API vazias conforme listado. Adicione `.env.local` com variáveis e um README minimal. Não gere conteúdo placeholder desnecessário.
+
+### 2) Prisma schema
+
+> **PROMPT:**
+> Implemente o `schema.prisma` exatamente como abaixo \[cole o schema]. Gere migrations. Crie seeds mínimos (Organization, Membership OWNER, Customer).
+
+### 3) Connect onboarding
+
+> **PROMPT:**
+> Implemente as rotas `POST /api/connect/create-account`, `POST /api/connect/account-link`, `POST /api/connect/login-link`.
+> Use Stripe Connect **Express** por padrão.
+> `create-account` deve criar conta conectada e salvar `acct_...` na `Organization`.
+> `account-link` deve receber `acct_...` e retornar a URL (`type=account_onboarding`, `refresh_url`, `return_url`).
+> `login-link` cria login link do Express Dashboard.
+> Utilize `Stripe-Account` quando apropriado. Inclua testes em modo teste.
+> **Documentação de referência:** direct charges, account links, authentication com `Stripe-Account`. ([Stripe Docs][2])
+
+### 4) Estimates + contrato + assinatura
+
+> **PROMPT:**
+> Crie CRUD de Estimates e LineItems. Adicione suporte a **ContractTemplate** por organização e **ContractSnapshot** por estimate.
+> Endpoints: `POST /api/estimates`, `POST /api/estimates/:id/send`, `POST /api/estimates/:id/accept`.
+> `accept` deve registrar nome + IP + timestamp e criar snapshot do contrato (substituindo placeholders).
+> UI: página pública do estimate com CTA para aceitar e seguir para pagamento.
+
+### 5) Invoice Sinal (connected) + fee 6% + hosted page
+
+> **PROMPT:**
+> Implemente `POST /api/invoices/deposit` que:
+>
+> * Calcula valor do sinal (ex.: 50% do `totalCents` do estimate).
+> * Cria **Invoice Items** no **connected account** usando header `Stripe-Account: acct_...`.
+> * Finaliza a Invoice e retorna `hosted_invoice_url`.
+> * Configura a cobrança para aplicar `application_fee_amount = 6%` do valor (em cents).
+>   **Referências:** hosted invoice page, invoices finalization, direct charges com fee. ([Stripe Docs][12])
+
+### 6) Webhook handler
+
+> **PROMPT:**
+> Implemente `POST /api/stripe/webhook` com **raw body** e verificação de assinatura. Trate `invoice.finalized`, `invoice.paid`, `payment_intent.succeeded`, `payment_intent.payment_failed`. Atualize `InvoiceRecord` e status/marcos do estimate. Logue tudo em `WebhookEvent`.
+> **Referência:** webhooks e tipos de eventos. ([Stripe Docs][16])
+
+### 7) Invoice Saldo (connected) + fee 6%
+
+> **PROMPT:**
+> Implemente `POST /api/invoices/balance` com a mesma lógica, habilitado somente após o webhook do sinal “paid”. Reaproveite utilitários de dinheiro (`money.ts`) para arredondamentos.
+
+### 8) Stripe Tax (opcional)
+
+> **PROMPT:**
+> Adicione flag `useStripeTax` na Organization. Se ativo, configure a Invoice para calcular impostos automaticamente por item.
+> **Referência:** Stripe Tax em invoices. ([Stripe Docs][6])
+
+---
+
+# Telas essenciais (UX rápido)
+
+* **Dashboard**: cards “Estimates em aberto”, “Pagamentos pendentes”, “Últimas faturas”
+* **Clientes**: tabela + criar/editar + link Stripe Customer opcional
+* **Estimates**:
+
+  * Lista / Criar
+  * Editor com itens + contrato (toggle “incluir contrato padrão”)
+  * Visualização pública com CTA “Aceitar” → “Gerar Sinal”
+* **Pagamentos**:
+
+  * Dentro do Estimate: botões condicionais (“Gerar Sinal” → “Pagar”, depois “Gerar Saldo”) exibindo `hosted_invoice_url`
+  * Status espelhado por webhooks
+* **Configurações da Organização**:
+
+  * Branding (logo, cor)
+  * Contrato padrão (editor markdown/html com placeholders)
+  * Stripe Connect (onboard/connect status, botão “Completar onboarding”, “Abrir Dashboard Express”)
+
+---
+
+# Notas de custos & escolhas
+
+* **Connect (Stripe handles pricing)**: sem mensalidade de plataforma; você cobra sua **application fee (6%)**; o prestador paga as taxas normais do Stripe. ([Stripe][17])
+* **Suas 6%**: aplique via `application_fee_amount` (cents). Garanta que o total permita essa dedução. ([Stripe Docs][4])
+
+---
+
+# QA checklist (antes de ir a produção)
+
+* [ ] Webhook recebendo e validando assinatura no ambiente **test**
+* [ ] Pagamento de `invoice` testa `invoice.paid` e reflete na UI
+* [ ] Fee de **6%** chegando no **saldo da plataforma** (test mode)
+* [ ] Account Link expira → `refresh_url` regenera e redireciona (testado) ([Stripe Docs][18])
+* [ ] ContractSnapshot congelado após aceite
+* [ ] Arredondamentos corretos (cents), sem centavos “fantasmas”
+* [ ] `Stripe-Account` usado sempre que agir no conectado
+
+---
+
+
+[1]: https://docs.stripe.com/connect/direct-charges?locale=en-GB&platform=ios&utm_source=chatgpt.com "Create direct charges"
+[2]: https://docs.stripe.com/connect/standard-accounts?utm_source=chatgpt.com "Using Connect with Standard connected accounts"
+[3]: https://docs.stripe.com/api/invoices/create?utm_source=chatgpt.com "Create an invoice | Stripe API Reference"
+[4]: https://docs.stripe.com/connect/direct-charges?utm_source=chatgpt.com "Create direct charges"
+[5]: https://docs.stripe.com/api/events/types?utm_source=chatgpt.com "Types of events | Stripe API Reference"
+[6]: https://docs.stripe.com/invoicing/taxes?utm_source=chatgpt.com "Taxes | Stripe Documentation"
+[7]: https://docs.stripe.com/api/accounts/create?utm_source=chatgpt.com "Create an account | Stripe API Reference"
+[8]: https://docs.stripe.com/api/account_links/create?utm_source=chatgpt.com "Create an account link | Stripe API Reference"
+[9]: https://docs.stripe.com/api/accounts/login_link/create?utm_source=chatgpt.com "Create a login link | Stripe API Reference"
+[10]: https://docs.stripe.com/connect/accounts?utm_source=chatgpt.com "Connect account types"
+[11]: https://docs.stripe.com/connect/authentication?utm_source=chatgpt.com "Making API calls for connected accounts"
+[12]: https://docs.stripe.com/invoicing/hosted-invoice-page?utm_source=chatgpt.com "Hosted Invoice Page"
+[13]: https://docs.stripe.com/api/payment-link?utm_source=chatgpt.com "Payment Link | Stripe API Reference"
+[14]: https://docs.stripe.com/api/prices?utm_source=chatgpt.com "Prices | Stripe API Reference"
+[15]: https://docs.stripe.com/payment-links?utm_source=chatgpt.com "Payment Links | Stripe Documentation"
+[16]: https://docs.stripe.com/webhooks?utm_source=chatgpt.com "Receive Stripe events in your webhook endpoint"
+[17]: https://stripe.com/connect/onboarding?utm_source=chatgpt.com "Stripe Connect | Seamless Vendor and Merchant Onboarding"
+[18]: https://docs.stripe.com/connect/hosted-onboarding?utm_source=chatgpt.com "Stripe-hosted onboarding"

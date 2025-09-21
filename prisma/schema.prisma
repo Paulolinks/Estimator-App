@@ -1,0 +1,294 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  accounts      Account[]
+  sessions      Session[]
+  memberships   Membership[]
+  createdAt     DateTime  @default(now())
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Organization {
+  id                 String  @id @default(cuid())
+  name               String
+  billingMode        String  @default("connect") // 'single' | 'connect'
+  stripeAccountId    String? // acct_...
+  contractTemplateId String? // default contract
+  users              Membership[]
+  customers          Customer[]
+  estimates          Estimate[]
+  invoices           Invoice[]
+  items              Item[]
+  expenses           Expense[]
+  contractTemplates  ContractTemplate[]
+  settings           OrganizationSettings?
+  createdAt          DateTime @default(now())
+}
+
+model Membership {
+  id           String @id @default(cuid())
+  orgId        String
+  userId       String
+  role         String  // OWNER | ADMIN | SALES
+  organization Organization @relation(fields: [orgId], references: [id])
+  user         User @relation(fields: [userId], references: [id])
+}
+
+model Customer {
+  id              String @id @default(cuid())
+  orgId           String
+  name            String
+  email           String?
+  phone           String?
+  mobile          String?
+  address         String?
+  city            String?
+  state           String?
+  zipCode         String?
+  country         String?
+  website         String?
+  notes           String?
+  stripeCustomerId String?
+  organization    Organization @relation(fields: [orgId], references: [id])
+  estimates       Estimate[]
+  invoices        Invoice[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model Estimate {
+  id             String   @id @default(cuid())
+  orgId          String
+  customerId     String
+  estimateNumber String
+  estimateDate   DateTime
+  validUntil     DateTime
+  status         String   @default("draft") // draft | sent | accepted | expired
+  expiresAt      DateTime?
+  subtotalCents  Int
+  taxCents       Int       @default(0)
+  discountCents  Int       @default(0)
+  totalCents     Int
+  notes          String?
+  contractId     String?   // snapshot
+  signatureId    String?
+  lineItems      LineItem[]
+  paymentPlan    PaymentSchedule?
+  contractSnapshot ContractSnapshot?
+  signature      Signature?
+  invoiceRecords InvoiceRecord[]
+  organization   Organization @relation(fields: [orgId], references: [id])
+  customer       Customer @relation(fields: [customerId], references: [id])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model LineItem {
+  id               String  @id @default(cuid())
+  estimateId       String
+  description      String
+  additionalDetails String?
+  quantity         Int
+  unitCents        Int
+  amountCents      Int
+  taxCode          String?
+  estimate         Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model PaymentSchedule {
+  id             String @id @default(cuid())
+  estimateId     String @unique
+  // Ex.: milestones: [{"name":"Sinal","percent":50},{"name":"Saldo","percent":50}]
+  milestonesJson String
+  estimate       Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model InvoiceRecord {
+  id               String   @id @default(cuid())
+  estimateId       String
+  type             String   // deposit | balance | milestone
+  stripeInvoiceId  String
+  hostedUrl        String
+  amountCents      Int
+  status           String   // open | paid | void
+  createdAt        DateTime @default(now())
+  estimate         Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model ContractTemplate {
+  id        String  @id @default(cuid())
+  orgId     String
+  name      String
+  content   String  // markdown / html com {{placeholders}}
+  active    Boolean @default(true)
+  organization Organization @relation(fields: [orgId], references: [id])
+}
+
+model ContractSnapshot {
+  id        String  @id @default(cuid())
+  estimateId String @unique
+  content   String
+  createdAt DateTime @default(now())
+  estimate  Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model Signature {
+  id          String  @id @default(cuid())
+  estimateId  String  @unique
+  signerName  String
+  ipAddress   String
+  signedAt    DateTime @default(now())
+  estimate    Estimate @relation(fields: [estimateId], references: [id])
+}
+
+model WebhookEvent {
+  id          String  @id @default(cuid())
+  stripeEvent String  @unique
+  type        String
+  payload     Json
+  processedAt DateTime?
+}
+
+// Invoice models
+model Invoice {
+  id            String   @id @default(cuid())
+  orgId         String
+  customerId    String
+  invoiceNumber String
+  invoiceDate   DateTime
+  dueDate       DateTime
+  status        String   @default("draft") // draft | sent | paid | overdue | cancelled
+  subtotalCents Int
+  taxCents      Int      @default(0)
+  discountCents Int      @default(0)
+  totalCents    Int
+  notes         String?
+  paidAt        DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  organization  Organization @relation(fields: [orgId], references: [id])
+  customer      Customer @relation(fields: [customerId], references: [id])
+  lineItems     InvoiceLineItem[]
+}
+
+model InvoiceLineItem {
+  id               String  @id @default(cuid())
+  invoiceId        String
+  description      String
+  additionalDetails String?
+  quantity         Int
+  unitCents        Int
+  amountCents      Int
+  invoice          Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+}
+
+// Item models
+model Item {
+  id          String   @id @default(cuid())
+  orgId       String
+  name        String
+  description String?
+  sku         String?
+  priceCents  Int
+  costCents   Int      @default(0)
+  category    String?
+  unit        String   @default("each")
+  taxable     Boolean  @default(true)
+  active      Boolean  @default(true)
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  organization Organization @relation(fields: [orgId], references: [id])
+}
+
+// Expense models
+model Expense {
+  id          String   @id @default(cuid())
+  orgId       String
+  merchant    String
+  description String
+  amountCents Int
+  category    String?
+  date        DateTime
+  receiptUrl  String?
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  organization Organization @relation(fields: [orgId], references: [id])
+}
+
+// Organization Settings
+model OrganizationSettings {
+  id                    String @id @default(cuid())
+  orgId                 String @unique
+  businessName          String?
+  businessEmail         String?
+  businessPhone         String?
+  businessAddress       String?
+  businessCity          String?
+  businessState         String?
+  businessZipCode       String?
+  businessCountry       String?
+  businessWebsite       String?
+  logoUrl               String?
+  defaultCurrency       String @default("USD")
+  defaultTaxRate        Float  @default(0)
+  defaultInvoicePrefix  String @default("INV")
+  defaultEstimatePrefix String @default("EST")
+  invoiceNotes          String?
+  estimateNotes         String?
+  requireClientSignature Boolean @default(false)
+  showFinancingOptions  Boolean @default(false)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  organization          Organization @relation(fields: [orgId], references: [id])
+}
